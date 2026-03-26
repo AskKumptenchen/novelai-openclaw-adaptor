@@ -16,7 +16,7 @@
 <p align="center">
   <a href="#quick-start">クイックスタート</a> ·
   <a href="#how-it-works">仕組み</a> ·
-  <a href="./README.md">English</a> ·
+  <a href="../README.md">English</a> ·
   <a href="./README.zh-CN.md">简体中文</a>
 </p>
 

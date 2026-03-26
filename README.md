@@ -16,8 +16,8 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="#how-it-works">How It Works</a> ·
-  <a href="./README.zh-CN.md">简体中文</a> ·
-  <a href="./README.ja.md">日本語</a>
+  <a href="./docs/README.zh-CN.md">简体中文</a> ·
+  <a href="./docs/README.ja.md">日本語</a>
 </p>
 
 <table>
