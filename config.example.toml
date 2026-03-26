@@ -1,0 +1,17 @@
+api_key = ""
+
+[ui]
+language = "en"
+
+[shim]
+host = "127.0.0.1"
+port = 18089
+upstream = "https://text.novelai.net/oa/v1/completions"
+model = "glm-4-6"
+
+[image]
+output_dir = "~/Pictures/novelai-openclaw-adaptor"
+model = "nai-diffusion-4-5-full"
+format = "png"
+output_prefix = "novelai"
+save_metadata = false
