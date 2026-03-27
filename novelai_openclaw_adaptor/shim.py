@@ -314,9 +314,15 @@ def build_upstream_request(payload: dict[str, Any], upstream: str, api_key: str,
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        # NovelAI's edge may reject the default Python urllib signature with Cloudflare 1010.
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Origin": "https://novelai.net",
+        "Referer": "https://novelai.net/",
     }
     if accept_sse:
-        headers["Accept"] = "text/event-stream"
+        headers["Accept"] = "text/event-stream, application/json, */*"
+    else:
+        headers["Accept"] = "application/json, text/plain, */*"
     return request.Request(
         upstream,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -350,15 +356,32 @@ def iter_sse_payloads(response: Any) -> Any:
         yield "\n".join(data_lines)
 
 
-def extract_stream_choice_text(choice: dict[str, Any]) -> str:
+def extract_stream_choice_text(choice: dict[str, Any]) -> tuple[str, bool]:
     if choice.get("text") is not None:
-        return str(choice.get("text", "")).replace("\r\n", "\n")
+        return str(choice.get("text", "")).replace("\r\n", "\n"), False
     delta = choice.get("delta")
     if isinstance(delta, dict) and delta.get("content") is not None:
-        return content_to_text(delta.get("content", "")).replace("\r\n", "\n")
+        return content_to_text(delta.get("content", "")).replace("\r\n", "\n"), True
     if choice.get("message") is not None:
-        return content_to_text((choice.get("message") or {}).get("content", "")).replace("\r\n", "\n")
-    return ""
+        return content_to_text((choice.get("message") or {}).get("content", "")).replace("\r\n", "\n"), False
+    return "", True
+
+
+def coerce_stream_text_delta(raw_text: str, state: dict[str, Any], *, is_delta: bool) -> str:
+    if not raw_text:
+        return ""
+    assembled = str(state.get("assembled_text", ""))
+    if is_delta:
+        state["assembled_text"] = assembled + raw_text
+        return raw_text
+    if raw_text.startswith(assembled):
+        new_text = raw_text[len(assembled) :]
+        state["assembled_text"] = raw_text
+        return new_text
+    if assembled.endswith(raw_text):
+        return ""
+    state["assembled_text"] = assembled + raw_text
+    return raw_text
 
 
 def normalize_chat_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -433,6 +456,14 @@ def call_upstream(payload: dict[str, Any], upstream: str, api_key: str) -> tuple
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         return exc.code, detail
+
+
+def try_parse_json(detail: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(detail)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class ShimHTTPServer(ThreadingHTTPServer):
@@ -596,7 +627,8 @@ class Handler(BaseHTTPRequestHandler):
             state = stream_states.setdefault(index, {"buffer": "", "started_text": False, "tool_mode": False})
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             delta_tool_calls = normalize_delta_tool_calls(delta.get("tool_calls") or choice.get("tool_calls"), base_id, index)
-            text = extract_stream_choice_text(choice)
+            raw_text, is_delta_text = extract_stream_choice_text(choice)
+            text = coerce_stream_text_delta(raw_text, state, is_delta=is_delta_text)
             finish_reason = choice.get("finish_reason")
 
             if delta_tool_calls:
@@ -723,12 +755,20 @@ class Handler(BaseHTTPRequestHandler):
                 )
         return out_events, saw_non_whitespace
 
-    def _normalize_upstream_completion_chunk(self, upstream_chunk: dict[str, Any], model: str) -> list[dict[str, Any]]:
+    def _normalize_upstream_completion_chunk(
+        self,
+        upstream_chunk: dict[str, Any],
+        model: str,
+        stream_states: dict[int, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         base_id = upstream_chunk.get("id", "cmpl-novelai-shim")
         created = upstream_chunk.get("created") or int(time.time())
         out_events = []
         for choice in upstream_chunk.get("choices") or []:
-            text = extract_stream_choice_text(choice)
+            index = choice.get("index", 0)
+            state = stream_states.setdefault(index, {"assembled_text": ""})
+            raw_text, is_delta_text = extract_stream_choice_text(choice)
+            text = coerce_stream_text_delta(raw_text, state, is_delta=is_delta_text)
             finish_reason = choice.get("finish_reason")
             if text or finish_reason is not None:
                 out_events.append(
@@ -737,7 +777,7 @@ class Handler(BaseHTTPRequestHandler):
                         "object": "text_completion",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": choice.get("index", 0), "text": text, "logprobs": None, "finish_reason": finish_reason}],
+                        "choices": [{"index": index, "text": text, "logprobs": None, "finish_reason": finish_reason}],
                     }
                 )
         return out_events
@@ -793,6 +833,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _proxy_completion_stream(self, payload: dict[str, Any], settings: dict[str, Any], model: str) -> None:
+        stream_states: dict[int, dict[str, Any]] = {}
         with open_upstream_stream(payload, settings["upstream"], settings["api_key"]) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             if "text/event-stream" not in content_type:
@@ -803,7 +844,7 @@ class Handler(BaseHTTPRequestHandler):
                 if raw_payload == "[DONE]":
                     break
                 upstream_chunk = json.loads(raw_payload)
-                for event_payload in self._normalize_upstream_completion_chunk(upstream_chunk, model):
+                for event_payload in self._normalize_upstream_completion_chunk(upstream_chunk, model, stream_states):
                     write_sse_event(self, event_payload)
             finish_sse(self)
 
@@ -885,12 +926,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             status, detail = call_upstream(upstream_body, settings["upstream"], settings["api_key"])
-            upstream_json = json.loads(detail)
             if not 200 <= status < 300:
                 self._send_json(
                     status,
                     {
                         "error": "upstream http error",
+                        "status": status,
+                        "detail": detail,
+                        "upstream_request": upstream_body,
+                        "path": self.path,
+                    },
+                )
+                return
+            upstream_json = try_parse_json(detail)
+            if upstream_json is None:
+                self._send_json(
+                    502,
+                    {
+                        "error": "upstream returned non-json success response",
                         "status": status,
                         "detail": detail,
                         "upstream_request": upstream_body,
@@ -915,8 +968,21 @@ class Handler(BaseHTTPRequestHandler):
                         "stop": body.get("stop") if body.get("stop") is not None else ["\nuser:", "\nsystem:"],
                     }
                     status2, detail2 = call_upstream(fallback_body, settings["upstream"], settings["api_key"])
-                    upstream_json2 = json.loads(detail2)
                     if 200 <= status2 < 300:
+                        upstream_json2 = try_parse_json(detail2)
+                        if upstream_json2 is None:
+                            self._send_json(
+                                502,
+                                {
+                                    "error": "upstream returned non-json success response",
+                                    "status": status2,
+                                    "detail": detail2,
+                                    "upstream_request": fallback_body,
+                                    "path": self.path,
+                                    "fallback": True,
+                                },
+                            )
+                            return
                         chat_resp = upstream_to_openai_chat(upstream_json2, model)
                     else:
                         self._send_json(
@@ -936,6 +1002,18 @@ class Handler(BaseHTTPRequestHandler):
 
             completion_resp = chat_to_completions(upstream_json, model)
             self._send_json(200, completion_resp)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self._send_json(
+                exc.code,
+                {
+                    "error": "upstream http error",
+                    "status": exc.code,
+                    "detail": detail,
+                    "upstream_request": upstream_body,
+                    "path": self.path,
+                },
+            )
         except Exception as exc:  # pragma: no cover
             self._send_json(
                 500,
