@@ -24,8 +24,13 @@ SUPPORTED_TEXT_MODELS = [
 TOOL_CALL_MARKER = "<tool_call>"
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][\w.-]*$")
 TOOL_ARG_RE = re.compile(r"^([A-Za-z_][\w.-]*)\s*:\s*(.*)$")
-PAREN_TOOL_CALL_RE = re.compile(r"^\((?P<name>[A-Za-z_][\w.-]*)\s*:\s*(?P<args>.*)\)$")
+PAREN_TOOL_CALL_RE = re.compile(r"\([^()\n]+\)")
+FUNC_TOOL_CALL_RE = re.compile(r"^(?P<name>[A-Za-z_][\w.-]*)\s*\(\s*(?P<args>.*?)(?:\))?\s*$")
+WRAPPED_FUNC_TOOL_CALL_RE = re.compile(r"\((?P<inner>[A-Za-z_][\w.-]*\([^()\n]*\))\)")
+FILE_PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:)?[A-Za-z0-9_./\\-]*[A-Za-z0-9_/-]\.(?:md|txt|json|toml|yaml|yml))")
 DEBUG_ENV_VAR = "NOVELAI_SHIM_DEBUG"
+ACTION_MODE_NATIVE = "native"
+ACTION_MODE_SINGLE_STEP = "single-step"
 
 
 def prompt_to_messages(prompt: Any) -> list[dict[str, Any]]:
@@ -156,6 +161,13 @@ def build_tool_argument_hints(tools: Any) -> dict[str, str]:
             continue
         properties = parameters.get("properties")
         required = parameters.get("required")
+        if isinstance(properties, dict):
+            for preferred_name in ("path", "url", "query", "command", "text"):
+                if preferred_name in properties:
+                    hints[name] = preferred_name
+                    break
+            if name in hints:
+                continue
         if isinstance(required, list) and len(required) == 1 and isinstance(required[0], str):
             hints[name] = required[0]
             continue
@@ -164,6 +176,10 @@ def build_tool_argument_hints(tools: Any) -> dict[str, str]:
             if isinstance(only_key, str):
                 hints[name] = only_key
     return hints
+
+
+def build_tool_name_set(tools: Any) -> set[str]:
+    return {tool["name"] for tool in normalize_tool_specs(tools) if isinstance(tool.get("name"), str)}
 
 
 def parse_tool_argument_value(value: str) -> Any:
@@ -176,6 +192,108 @@ def parse_tool_argument_value(value: str) -> Any:
         except Exception:
             return text
     return text
+
+
+def parse_inline_named_arguments(value: str) -> dict[str, Any] | None:
+    text = value.strip()
+    if not text:
+        return {}
+    if text.startswith('"') and '":' in text:
+        try:
+            parsed_fragment = json.loads("{" + text + "}")
+        except Exception:
+            parsed_fragment = None
+        if isinstance(parsed_fragment, dict):
+            return parsed_fragment
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    match = TOOL_ARG_RE.match(text)
+    if not match:
+        return None
+    return {match.group(1): parse_tool_argument_value(match.group(2))}
+
+
+def strip_tool_line_prefix(line: str) -> str:
+    return re.sub(r"^(?:assistant|asistant)\s*:\s*", "", line.strip(), flags=re.IGNORECASE)
+
+
+def strip_tool_noise(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            lines.append(raw_line)
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("tool["):
+            break
+        if lowered.startswith("assistant:"):
+            break
+        if lowered.startswith("</think"):
+            break
+        lines.append(raw_line)
+    return "\n".join(lines).strip()
+
+
+def normalize_tool_args_for_name(name: str, args: dict[str, Any], tool_argument_hints: dict[str, str] | None) -> dict[str, Any]:
+    normalized = dict(args)
+    primary_arg = (tool_argument_hints or {}).get(name)
+    if primary_arg and primary_arg not in normalized:
+        for alias in ("args", "input", "value"):
+            if alias in normalized and normalized[alias] not in (None, ""):
+                normalized[primary_arg] = normalized.pop(alias)
+                break
+    for key, value in list(normalized.items()):
+        if isinstance(value, str):
+            normalized[key] = strip_tool_noise(value)
+    return {key: value for key, value in normalized.items() if value not in (None, "")}
+
+
+def has_required_primary_arg(name: str, args: dict[str, Any], tool_argument_hints: dict[str, str] | None) -> bool:
+    primary_arg = (tool_argument_hints or {}).get(name)
+    if not primary_arg:
+        return True
+    value = args.get(primary_arg)
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
+
+
+def first_path_like_text(text: str) -> str | None:
+    match = FILE_PATH_RE.search(text)
+    if not match:
+        return None
+    return str(match.group("path")).strip()
+
+
+def synthesize_read_tool_call_from_text(
+    text: str,
+    fallback_id: str,
+    tool_argument_hints: dict[str, str] | None,
+    valid_tool_names: set[str] | None,
+) -> dict[str, Any] | None:
+    if valid_tool_names and "read" not in valid_tool_names:
+        return None
+    arg_name = (tool_argument_hints or {}).get("read", "path")
+    if arg_name != "path":
+        return None
+    path = first_path_like_text(text)
+    if not path:
+        return None
+    return {
+        "id": fallback_id,
+        "type": "function",
+        "function": {
+            "name": "read",
+            "arguments": json.dumps({"path": path}, ensure_ascii=False),
+        },
+    }
 
 
 def normalize_tool_call_entry(entry: dict[str, Any], fallback_id: str) -> dict[str, Any] | None:
@@ -196,7 +314,12 @@ def normalize_tool_call_entry(entry: dict[str, Any], fallback_id: str) -> dict[s
     }
 
 
-def parse_tool_block(block: str, fallback_id: str) -> dict[str, Any] | None:
+def parse_tool_block(
+    block: str,
+    fallback_id: str,
+    tool_argument_hints: dict[str, str] | None = None,
+    valid_tool_names: set[str] | None = None,
+) -> dict[str, Any] | None:
     lines = [line.rstrip() for line in block.strip().splitlines()]
     while lines and not lines[0].strip():
         lines.pop(0)
@@ -211,6 +334,10 @@ def parse_tool_block(block: str, fallback_id: str) -> dict[str, Any] | None:
         name = first
         body_lines = lines[1:]
     if not TOOL_NAME_RE.fullmatch(name):
+        return None
+    if valid_tool_names and name not in valid_tool_names:
+        return None
+    if not body_lines:
         return None
 
     args: dict[str, Any] = {}
@@ -249,6 +376,11 @@ def parse_tool_block(block: str, fallback_id: str) -> dict[str, Any] | None:
         if not isinstance(parsed, dict):
             return None
         args = parsed
+    args = normalize_tool_args_for_name(name, args, tool_argument_hints)
+    if not args and (tool_argument_hints or {}).get(name):
+        return None
+    if not has_required_primary_arg(name, args, tool_argument_hints):
+        return None
 
     return {
         "id": fallback_id,
@@ -264,23 +396,86 @@ def parse_parenthesized_tool_call(
     line: str,
     fallback_id: str,
     tool_argument_hints: dict[str, str] | None,
+    valid_tool_names: set[str] | None = None,
 ) -> dict[str, Any] | None:
-    match = PAREN_TOOL_CALL_RE.match(line.strip())
-    if not match:
+    normalized_line = strip_tool_line_prefix(line)
+    if not (normalized_line.startswith("(") and normalized_line.endswith(")")):
         return None
-    name = match.group("name")
+    body = normalized_line[1:-1].strip()
+    if not body:
+        return None
+    name = ""
+    raw_args = ""
+    colon_match = re.match(r"^(?P<name>[A-Za-z_][\w.-]*)\s*:\s*(?P<args>.+)$", body)
+    if colon_match:
+        name = str(colon_match.group("name"))
+        raw_args = str(colon_match.group("args")).strip()
+    else:
+        space_match = re.match(r"^(?P<name>[A-Za-z_][\w.-]*)\s+(?P<args>.+)$", body)
+        if not space_match:
+            return None
+        name = str(space_match.group("name"))
+        raw_args = str(space_match.group("args")).strip()
     if not TOOL_NAME_RE.fullmatch(name):
         return None
-    raw_args = match.group("args").strip()
-    parsed_value = parse_tool_argument_value(raw_args)
-    if isinstance(parsed_value, dict):
-        arguments = parsed_value
+    if valid_tool_names and name not in valid_tool_names:
+        return None
+    if not raw_args:
+        return None
+    parsed_args = parse_inline_named_arguments(raw_args)
+    if isinstance(parsed_args, dict):
+        arguments = normalize_tool_args_for_name(name, parsed_args, tool_argument_hints)
     else:
+        parsed_value = parse_tool_argument_value(raw_args)
         arg_name = (tool_argument_hints or {}).get(name)
         if arg_name:
             arguments = {arg_name: parsed_value}
         else:
             arguments = {"input": parsed_value}
+        arguments = normalize_tool_args_for_name(name, arguments, tool_argument_hints)
+    if not has_required_primary_arg(name, arguments, tool_argument_hints):
+        return None
+    return {
+        "id": fallback_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        },
+    }
+
+
+def parse_function_style_tool_call(
+    line: str,
+    fallback_id: str,
+    tool_argument_hints: dict[str, str] | None,
+    valid_tool_names: set[str] | None = None,
+) -> dict[str, Any] | None:
+    normalized_line = strip_tool_line_prefix(line)
+    match = FUNC_TOOL_CALL_RE.match(normalized_line)
+    if not match:
+        return None
+    name = match.group("name")
+    if not TOOL_NAME_RE.fullmatch(name):
+        return None
+    if valid_tool_names and name not in valid_tool_names:
+        return None
+    raw_args = match.group("args").strip()
+    if not raw_args:
+        return None
+    parsed_args = parse_inline_named_arguments(raw_args)
+    if isinstance(parsed_args, dict):
+        arguments = normalize_tool_args_for_name(name, parsed_args, tool_argument_hints)
+    else:
+        parsed_value = parse_tool_argument_value(raw_args)
+        arg_name = (tool_argument_hints or {}).get(name)
+        if arg_name:
+            arguments = {arg_name: parsed_value}
+        else:
+            arguments = {"input": parsed_value}
+        arguments = normalize_tool_args_for_name(name, arguments, tool_argument_hints)
+    if not has_required_primary_arg(name, arguments, tool_argument_hints):
+        return None
     return {
         "id": fallback_id,
         "type": "function",
@@ -296,16 +491,43 @@ def extract_parenthesized_tool_calls_from_text(
     base_id: str,
     choice_index: int,
     tool_argument_hints: dict[str, str] | None,
+    valid_tool_names: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     parsed: list[dict[str, Any]] = []
-    for line_index, raw_line in enumerate(text.splitlines(), start=1):
-        tool_call = parse_parenthesized_tool_call(
-            raw_line,
-            f"call_{base_id}_{choice_index}_{line_index}",
-            tool_argument_hints,
-        )
-        if tool_call is not None:
-            parsed.append(tool_call)
+    item_index = 0
+    for raw_line in text.splitlines():
+        normalized_line = strip_tool_line_prefix(raw_line)
+        for match in WRAPPED_FUNC_TOOL_CALL_RE.finditer(normalized_line):
+            item_index += 1
+            tool_call = parse_function_style_tool_call(
+                match.group("inner"),
+                f"call_{base_id}_{choice_index}_{item_index}",
+                tool_argument_hints,
+                valid_tool_names,
+            )
+            if tool_call is not None:
+                parsed.append(tool_call)
+        for match in PAREN_TOOL_CALL_RE.finditer(normalized_line):
+            item_index += 1
+            chunk = match.group(0)
+            tool_call = parse_parenthesized_tool_call(
+                chunk,
+                f"call_{base_id}_{choice_index}_{item_index}",
+                tool_argument_hints,
+                valid_tool_names,
+            )
+            if tool_call is not None:
+                parsed.append(tool_call)
+        if "(" not in normalized_line:
+            item_index += 1
+            tool_call = parse_function_style_tool_call(
+                normalized_line,
+                f"call_{base_id}_{choice_index}_{item_index}",
+                tool_argument_hints,
+                valid_tool_names,
+            )
+            if tool_call is not None:
+                parsed.append(tool_call)
     return parsed
 
 
@@ -314,13 +536,28 @@ def extract_tool_calls_from_text(
     base_id: str,
     choice_index: int,
     tool_argument_hints: dict[str, str] | None = None,
+    valid_tool_names: set[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     source = strip_think_markup(sanitize_generated_text(content_to_text(text)))
     if TOOL_CALL_MARKER not in source:
-        parenthesized = extract_parenthesized_tool_calls_from_text(source, base_id, choice_index, tool_argument_hints)
+        parenthesized = extract_parenthesized_tool_calls_from_text(
+            source,
+            base_id,
+            choice_index,
+            tool_argument_hints,
+            valid_tool_names,
+        )
         if parenthesized:
             # Force OpenClaw back into its normal multi-turn tool loop.
             return "", parenthesized[:1]
+        synthesized_read = synthesize_read_tool_call_from_text(
+            source,
+            f"call_{base_id}_{choice_index}_read_fallback",
+            tool_argument_hints,
+            valid_tool_names,
+        )
+        if synthesized_read is not None:
+            return "", [synthesized_read]
         return source, []
 
     parts = source.split(TOOL_CALL_MARKER)
@@ -328,7 +565,12 @@ def extract_tool_calls_from_text(
     tool_calls: list[dict[str, Any]] = []
 
     for block_index, block in enumerate(parts[1:], start=1):
-        tool_call = parse_tool_block(block, f"call_{base_id}_{choice_index}_{block_index}")
+        tool_call = parse_tool_block(
+            block,
+            f"call_{base_id}_{choice_index}_{block_index}",
+            tool_argument_hints,
+            valid_tool_names,
+        )
         if tool_call is None:
             visible_parts.append(f"{TOOL_CALL_MARKER}{block}")
             continue
@@ -338,9 +580,23 @@ def extract_tool_calls_from_text(
     normalized_visible = sanitize_generated_text(visible_text)
     if tool_calls:
         return "", tool_calls[:1]
-    parenthesized = extract_parenthesized_tool_calls_from_text(normalized_visible, base_id, choice_index, tool_argument_hints)
+    parenthesized = extract_parenthesized_tool_calls_from_text(
+        normalized_visible,
+        base_id,
+        choice_index,
+        tool_argument_hints,
+        valid_tool_names,
+    )
     if parenthesized:
         return "", parenthesized[:1]
+    synthesized_read = synthesize_read_tool_call_from_text(
+        normalized_visible,
+        f"call_{base_id}_{choice_index}_read_fallback",
+        tool_argument_hints,
+        valid_tool_names,
+    )
+    if synthesized_read is not None:
+        return "", [synthesized_read]
     return normalized_visible, []
 
 
@@ -349,6 +605,7 @@ def choice_tool_calls(
     base_id: str,
     choice_index: int,
     tool_argument_hints: dict[str, str] | None = None,
+    valid_tool_names: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     message = choice.get("message")
     if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
@@ -371,7 +628,13 @@ def choice_tool_calls(
                 out.append(normalized)
         if out:
             return out
-    _, parsed = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index, tool_argument_hints)
+    _, parsed = extract_tool_calls_from_text(
+        extract_choice_text(choice),
+        base_id,
+        choice_index,
+        tool_argument_hints,
+        valid_tool_names,
+    )
     return parsed
 
 
@@ -380,11 +643,18 @@ def choice_visible_text(
     base_id: str,
     choice_index: int,
     tool_argument_hints: dict[str, str] | None = None,
+    valid_tool_names: set[str] | None = None,
 ) -> str:
     message = choice.get("message")
     if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
         return sanitize_generated_text(content_to_text(message.get("content", "")))
-    text, _ = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index, tool_argument_hints)
+    text, _ = extract_tool_calls_from_text(
+        extract_choice_text(choice),
+        base_id,
+        choice_index,
+        tool_argument_hints,
+        valid_tool_names,
+    )
     return text
 
 
@@ -439,13 +709,14 @@ def upstream_to_openai_chat(
     chat_resp: dict[str, Any],
     model: str,
     tool_argument_hints: dict[str, str] | None = None,
+    valid_tool_names: set[str] | None = None,
 ) -> dict[str, Any]:
     choices = []
     base_id = chat_resp.get("id", "chatcmpl-novelai-shim")
     for choice in chat_resp.get("choices", []):
         index = choice.get("index", 0)
-        text = choice_visible_text(choice, base_id, index, tool_argument_hints)
-        tool_calls = choice_tool_calls(choice, base_id, index, tool_argument_hints)
+        text = choice_visible_text(choice, base_id, index, tool_argument_hints, valid_tool_names)
+        tool_calls = choice_tool_calls(choice, base_id, index, tool_argument_hints, valid_tool_names)
         finish_reason = choice.get("finish_reason")
         if tool_calls and finish_reason in (None, "stop"):
             finish_reason = "tool_calls"
@@ -572,6 +843,47 @@ def render_tool_call_block(tool_call: dict[str, Any]) -> str:
     return f"{TOOL_CALL_MARKER}\nname: {name}\n{arguments}"
 
 
+def normalize_tool_specs(tools: Any) -> list[dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for entry in tools:
+        if not isinstance(entry, dict) or entry.get("type") != "function":
+            continue
+        function = entry.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not TOOL_NAME_RE.fullmatch(name):
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "description": str(function.get("description", "") or "").strip(),
+                "parameters": function.get("parameters", {}),
+            }
+        )
+    return normalized
+
+
+def compact_tool_schema(tool: dict[str, Any]) -> str:
+    name = str(tool.get("name", "")).strip()
+    description = str(tool.get("description", "") or "").strip()
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        return f"- {name}: {description or '(no description)'}"
+    required = parameters.get("required")
+    properties = parameters.get("properties")
+    arg_text = ""
+    if isinstance(required, list) and required:
+        arg_text = ", ".join(str(item) for item in required[:3] if isinstance(item, str))
+    elif isinstance(properties, dict) and properties:
+        arg_text = ", ".join(str(item) for item in list(properties.keys())[:3] if isinstance(item, str))
+    if arg_text:
+        return f"- {name}({arg_text}): {description or '(no description)'}"
+    return f"- {name}: {description or '(no description)'}"
+
+
 def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     lines = []
     for msg in messages:
@@ -619,11 +931,42 @@ def last_user_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def chat_request_from_body(body: dict[str, Any]) -> dict[str, Any]:
+def build_single_step_action_prompt(messages: list[dict[str, Any]], tools: Any, tool_choice: Any) -> str:
+    normalized_tools = normalize_tool_specs(tools)
+    lines = [
+        "system: You are a single-step action router for an OpenClaw session.",
+        "system: Decide exactly one next step.",
+        "system: If a tool is needed, output exactly one tool call and nothing else.",
+        'system: Use this exact tool format on a single line: (tool_name: {"arg":"value"})',
+        "system: If a tool has a single obvious argument, plain text is also allowed: (tool_name: value)",
+        "system: Never narrate plans, startup steps, reasoning, or intentions.",
+        "system: Never output more than one tool call in a single turn.",
+        "system: If the instructions require reading files or checking state first, do that tool call now instead of greeting.",
+        "system: If no tool is needed, reply with the final assistant message only.",
+    ]
+    if tool_choice not in (None, "auto"):
+        lines.append(f"system: tool_choice={json.dumps(tool_choice, ensure_ascii=False)}")
+    if normalized_tools:
+        lines.append("system: Available tools:")
+        for tool in normalized_tools:
+            lines.append(f"system: {compact_tool_schema(tool)}")
+    lines.append("system: Conversation transcript follows.")
+    lines.append(messages_to_prompt(messages))
+    return "\n".join(lines)
+
+
+def prompt_from_body(body: dict[str, Any], *, action_mode: str = ACTION_MODE_NATIVE) -> str:
+    messages = normalize_chat_messages(body)
+    if action_mode == ACTION_MODE_SINGLE_STEP and normalize_tool_specs(body.get("tools")):
+        return build_single_step_action_prompt(messages, body.get("tools"), body.get("tool_choice"))
+    return messages_to_prompt(messages)
+
+
+def chat_request_from_body(body: dict[str, Any], *, action_mode: str = ACTION_MODE_NATIVE) -> dict[str, Any]:
     messages = normalize_chat_messages(body)
     out = {
         "model": body.get("model", "glm-4-6"),
-        "prompt": messages_to_prompt(messages),
+        "prompt": prompt_from_body(body, action_mode=action_mode),
         "temperature": body.get("temperature", 1),
         "top_p": body.get("top_p", 1),
         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
@@ -643,13 +986,23 @@ def chat_request_from_body(body: dict[str, Any]) -> dict[str, Any]:
         message_count=len(messages),
         tool_count=len(body.get("tools") or []),
         tool_choice=body.get("tool_choice"),
+        action_mode=action_mode,
         stream=body.get("stream"),
         prompt_preview=truncate_debug_text(out["prompt"]),
     )
     return out
 
 
-def fallback_prompt_from_body(body: dict[str, Any]) -> str:
+def fallback_prompt_from_body(body: dict[str, Any], *, action_mode: str = ACTION_MODE_NATIVE) -> str:
+    if action_mode == ACTION_MODE_SINGLE_STEP and normalize_tool_specs(body.get("tools")):
+        prompt = prompt_from_body(body, action_mode=action_mode)
+        debug_event(
+            "fallback_prompt_single_step",
+            message_count=len(normalize_chat_messages(body)),
+            tool_count=len(body.get("tools") or []),
+            prompt_preview=truncate_debug_text(prompt),
+        )
+        return prompt
     messages = normalize_chat_messages(body)
     last_user = last_user_text(messages)
     if not last_user:
@@ -672,6 +1025,14 @@ def fallback_prompt_from_body(body: dict[str, Any]) -> str:
         prompt_preview=truncate_debug_text(prompt),
     )
     return prompt
+
+
+def should_buffer_tool_stream(body: dict[str, Any], settings: dict[str, Any], *, is_chat: bool, wants_stream: bool) -> bool:
+    if not is_chat or not wants_stream:
+        return False
+    if settings.get("action_mode") != ACTION_MODE_SINGLE_STEP:
+        return False
+    return bool(normalize_tool_specs(body.get("tools")))
 
 
 def call_upstream(payload: dict[str, Any], upstream: str, api_key: str) -> tuple[int, str]:
@@ -844,6 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
         role_sent: set[int],
         stream_states: dict[int, dict[str, Any]],
         tool_argument_hints: dict[str, str] | None = None,
+        valid_tool_names: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         base_id = upstream_chunk.get("id", "chatcmpl-novelai-shim")
         created = upstream_chunk.get("created") or int(time.time())
@@ -893,6 +1255,7 @@ class Handler(BaseHTTPRequestHandler):
                 base_id,
                 index,
                 tool_argument_hints,
+                valid_tool_names,
             )
             new_text, emitted_snapshot = compute_incremental_text(str(state.get("emitted_text", "")), visible_text)
             state["emitted_text"] = emitted_snapshot
@@ -977,9 +1340,15 @@ class Handler(BaseHTTPRequestHandler):
                 )
         return out_events
 
-    def _stream_plain_chat_response(self, response: Any, model: str, tool_argument_hints: dict[str, str] | None = None) -> None:
+    def _stream_plain_chat_response(
+        self,
+        response: Any,
+        model: str,
+        tool_argument_hints: dict[str, str] | None = None,
+        valid_tool_names: set[str] | None = None,
+    ) -> None:
         detail = response.read().decode("utf-8")
-        chat_resp = upstream_to_openai_chat(json.loads(detail), model, tool_argument_hints)
+        chat_resp = upstream_to_openai_chat(json.loads(detail), model, tool_argument_hints, valid_tool_names)
         self._send_chat_sse(chat_resp)
 
     def _stream_plain_completion_response(self, response: Any, model: str) -> None:
@@ -993,6 +1362,7 @@ class Handler(BaseHTTPRequestHandler):
         settings: dict[str, Any],
         model: str,
         tool_argument_hints: dict[str, str] | None = None,
+        valid_tool_names: set[str] | None = None,
     ) -> bool:
         role_sent: set[int] = set()
         stream_states: dict[int, dict[str, Any]] = {}
@@ -1002,7 +1372,7 @@ class Handler(BaseHTTPRequestHandler):
         with open_upstream_stream(payload, settings["upstream"], settings["api_key"]) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             if "text/event-stream" not in content_type:
-                self._stream_plain_chat_response(response, model, tool_argument_hints)
+                self._stream_plain_chat_response(response, model, tool_argument_hints, valid_tool_names)
                 return True
             for raw_payload in iter_sse_payloads(response):
                 if raw_payload == "[DONE]":
@@ -1014,6 +1384,7 @@ class Handler(BaseHTTPRequestHandler):
                     role_sent,
                     stream_states,
                     tool_argument_hints,
+                    valid_tool_names,
                 )
                 saw_non_whitespace = saw_non_whitespace or chunk_has_text
                 if not events:
@@ -1089,7 +1460,7 @@ class Handler(BaseHTTPRequestHandler):
 
         is_chat = self.path in ["/v1/chat/completions", "/chat/completions"]
         wants_stream = bool(body.get("stream"))
-        upstream_body = chat_request_from_body(body) if is_chat else body
+        upstream_body = chat_request_from_body(body, action_mode=settings.get("action_mode", ACTION_MODE_NATIVE)) if is_chat else body
         debug_event(
             "incoming_request",
             path=self.path,
@@ -1101,13 +1472,110 @@ class Handler(BaseHTTPRequestHandler):
         try:
             model = body.get("model", settings["model"])
             tool_argument_hints = build_tool_argument_hints(body.get("tools"))
+            valid_tool_names = build_tool_name_set(body.get("tools"))
+            buffered_tool_stream = should_buffer_tool_stream(body, settings, is_chat=is_chat, wants_stream=wants_stream)
             if wants_stream:
                 if is_chat:
-                    if self._proxy_chat_stream(upstream_body, settings, model, tool_argument_hints):
+                    if buffered_tool_stream:
+                        debug_event(
+                            "buffered_tool_stream_enabled",
+                            model=model,
+                            action_mode=settings.get("action_mode"),
+                            tool_count=len(valid_tool_names),
+                        )
+                        buffered_upstream_body = dict(upstream_body)
+                        buffered_upstream_body.pop("stream", None)
+                        status, detail = call_upstream(buffered_upstream_body, settings["upstream"], settings["api_key"])
+                        debug_event(
+                            "buffered_tool_stream_response",
+                            status=status,
+                            detail_preview=truncate_debug_text(detail),
+                        )
+                        if not 200 <= status < 300:
+                            self._send_json(
+                                status,
+                                {
+                                    "error": "upstream http error",
+                                    "status": status,
+                                    "detail": detail,
+                                    "upstream_request": buffered_upstream_body,
+                                    "path": self.path,
+                                },
+                            )
+                            return
+                        upstream_json = try_parse_json(detail)
+                        if upstream_json is None:
+                            self._send_json(
+                                502,
+                                {
+                                    "error": "upstream returned non-json success response",
+                                    "status": status,
+                                    "detail": detail,
+                                    "upstream_request": buffered_upstream_body,
+                                    "path": self.path,
+                                },
+                            )
+                            return
+                        chat_resp = upstream_to_openai_chat(upstream_json, model, tool_argument_hints, valid_tool_names)
+                        first_message = (((chat_resp.get("choices") or [{}])[0].get("message") or {}))
+                        content = first_message.get("content") or ""
+                        tool_calls = first_message.get("tool_calls") or []
+                        if not content.strip() and not tool_calls:
+                            fallback_body = {
+                                "model": model,
+                                "prompt": fallback_prompt_from_body(body, action_mode=settings.get("action_mode", ACTION_MODE_NATIVE)),
+                                "temperature": body.get("temperature", 1),
+                                "top_p": body.get("top_p", 1),
+                                "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
+                                "stop": body.get("stop") if body.get("stop") is not None else ["\nuser:", "\nsystem:"],
+                            }
+                            if body.get("presence_penalty") is not None:
+                                fallback_body["presence_penalty"] = body["presence_penalty"]
+                            if body.get("frequency_penalty") is not None:
+                                fallback_body["frequency_penalty"] = body["frequency_penalty"]
+                            if body.get("n") is not None:
+                                fallback_body["n"] = body["n"]
+                            status2, detail2 = call_upstream(fallback_body, settings["upstream"], settings["api_key"])
+                            debug_event(
+                                "buffered_tool_stream_fallback_response",
+                                status=status2,
+                                detail_preview=truncate_debug_text(detail2),
+                            )
+                            if not 200 <= status2 < 300:
+                                self._send_json(
+                                    status2,
+                                    {
+                                        "error": "upstream http error",
+                                        "status": status2,
+                                        "detail": detail2,
+                                        "upstream_request": fallback_body,
+                                        "path": self.path,
+                                        "fallback": True,
+                                    },
+                                )
+                                return
+                            upstream_json2 = try_parse_json(detail2)
+                            if upstream_json2 is None:
+                                self._send_json(
+                                    502,
+                                    {
+                                        "error": "upstream returned non-json success response",
+                                        "status": status2,
+                                        "detail": detail2,
+                                        "upstream_request": fallback_body,
+                                        "path": self.path,
+                                        "fallback": True,
+                                    },
+                                )
+                                return
+                            chat_resp = upstream_to_openai_chat(upstream_json2, model, tool_argument_hints, valid_tool_names)
+                        self._send_chat_sse(chat_resp)
+                        return
+                    if self._proxy_chat_stream(upstream_body, settings, model, tool_argument_hints, valid_tool_names):
                         return
                     fallback_body = {
                         "model": model,
-                        "prompt": fallback_prompt_from_body(body),
+                        "prompt": fallback_prompt_from_body(body, action_mode=settings.get("action_mode", ACTION_MODE_NATIVE)),
                         "temperature": body.get("temperature", 1),
                         "top_p": body.get("top_p", 1),
                         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
@@ -1120,7 +1588,7 @@ class Handler(BaseHTTPRequestHandler):
                         fallback_body["frequency_penalty"] = body["frequency_penalty"]
                     if body.get("n") is not None:
                         fallback_body["n"] = body["n"]
-                    if self._proxy_chat_stream(fallback_body, settings, model, tool_argument_hints):
+                    if self._proxy_chat_stream(fallback_body, settings, model, tool_argument_hints, valid_tool_names):
                         return
                     self._start_sse(200)
                     write_sse_event(
@@ -1171,14 +1639,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if is_chat:
-                chat_resp = upstream_to_openai_chat(upstream_json, model, tool_argument_hints)
+                chat_resp = upstream_to_openai_chat(upstream_json, model, tool_argument_hints, valid_tool_names)
                 first_message = (((chat_resp.get("choices") or [{}])[0].get("message") or {}))
                 content = first_message.get("content") or ""
                 tool_calls = first_message.get("tool_calls") or []
                 if not content.strip() and not tool_calls:
                     fallback_body = {
                         "model": model,
-                        "prompt": fallback_prompt_from_body(body),
+                        "prompt": fallback_prompt_from_body(body, action_mode=settings.get("action_mode", ACTION_MODE_NATIVE)),
                         "temperature": body.get("temperature", 1),
                         "top_p": body.get("top_p", 1),
                         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
@@ -1200,7 +1668,7 @@ class Handler(BaseHTTPRequestHandler):
                                 },
                             )
                             return
-                        chat_resp = upstream_to_openai_chat(upstream_json2, model, tool_argument_hints)
+                        chat_resp = upstream_to_openai_chat(upstream_json2, model, tool_argument_hints, valid_tool_names)
                     else:
                         self._send_json(
                             status2,
@@ -1250,6 +1718,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=None, help="Listen port")
     parser.add_argument("--upstream", default=None, help="NovelAI upstream completions endpoint")
     parser.add_argument("--model", default=None, help="Model ID exposed to OpenClaw")
+    parser.add_argument("--action-mode", choices=[ACTION_MODE_NATIVE, ACTION_MODE_SINGLE_STEP], default=None, help="Tool orchestration mode: native or single-step")
     return parser
 
 
@@ -1265,12 +1734,16 @@ def resolve_runtime_settings(args: argparse.Namespace) -> tuple[dict[str, Any], 
         prompt_text=choose_text(lang, "NovelAI API key not found. Enter it to start the shim: ", "未检测到 NovelAI API Key，请输入后启动 shim: "),
         lang=lang,
     )
+    action_mode = str(args.action_mode or config["shim"].get("action_mode", ACTION_MODE_SINGLE_STEP)).strip().lower()
+    if action_mode not in {ACTION_MODE_NATIVE, ACTION_MODE_SINGLE_STEP}:
+        action_mode = ACTION_MODE_NATIVE
     settings = {
         "api_key": api_key,
         "host": args.host or config["shim"]["host"],
         "port": args.port if args.port is not None else int(config["shim"]["port"]),
         "upstream": args.upstream or config["shim"]["upstream"],
         "model": args.model or config["shim"]["model"],
+        "action_mode": action_mode,
         "language": lang,
     }
     return settings, config_path
@@ -1283,8 +1756,8 @@ def run_server(settings: dict[str, Any]) -> None:
     print(
         choose_text(
             lang,
-            f"NovelAI shim listening on http://{settings['host']}:{settings['port']}",
-            f"NovelAI shim 已启动: http://{settings['host']}:{settings['port']}",
+            f"NovelAI shim listening on http://{settings['host']}:{settings['port']} (mode: {settings['action_mode']})",
+            f"NovelAI shim 已启动: http://{settings['host']}:{settings['port']} (mode: {settings['action_mode']})",
         )
     )
     server.serve_forever()

@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Main config groups:\n"
             "  - ui.language\n"
             "  - api_key\n"
-            "  - shim.host / shim.port / shim.upstream / shim.model\n"
+            "  - shim.host / shim.port / shim.upstream / shim.model / shim.action_mode\n"
             "  - image.output_dir / image.model / image.format / image.output_prefix / image.save_metadata"
         ),
         epilog=(
@@ -131,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser.add_argument("--shim-port", type=int, default=None, help="Shim listen port")
     set_parser.add_argument("--shim-upstream", default=None, help="Shim upstream completions endpoint")
     set_parser.add_argument("--shim-model", choices=TEXT_MODEL_VALUES, default=None, help=f"Default shim model ID ({TEXT_MODEL_IDS})")
+    set_parser.add_argument("--shim-action-mode", choices=["native", "single-step"], default=None, help="Shim action mode: native or single-step")
     set_parser.add_argument("--image-output-dir", default=None, help="Default image output directory")
     set_parser.add_argument("--image-model", choices=IMAGE_MODEL_VALUES, default=None, help=f"Default image model ({IMAGE_MODEL_IDS})")
     set_parser.add_argument("--image-format", choices=["png", "webp", "jpeg"], default=None, help="Default image format")
@@ -339,6 +340,8 @@ def handle_set(args: argparse.Namespace) -> int:
         config["shim"]["upstream"] = args.shim_upstream
     if args.shim_model is not None:
         config["shim"]["model"] = args.shim_model
+    if args.shim_action_mode is not None:
+        config["shim"]["action_mode"] = args.shim_action_mode
     if args.image_output_dir is not None:
         config["image"]["output_dir"] = args.image_output_dir
     if args.image_model is not None:

@@ -66,6 +66,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "port": 18089,
         "upstream": "https://text.novelai.net/oa/v1/completions",
         "model": "glm-4-6",
+        "action_mode": "single-step",
     },
     "image": {
         "output_dir": str(default_output_dir()),
@@ -99,6 +100,8 @@ def env_config() -> dict[str, Any]:
         shim["upstream"] = os.environ["NOVELAI_UPSTREAM"]
     if os.environ.get("NOVELAI_SHIM_MODEL"):
         shim["model"] = os.environ["NOVELAI_SHIM_MODEL"]
+    if os.environ.get("NOVELAI_SHIM_ACTION_MODE"):
+        shim["action_mode"] = os.environ["NOVELAI_SHIM_ACTION_MODE"]
     if os.environ.get("NOVELAI_SHIM_PORT"):
         shim["port"] = int(os.environ["NOVELAI_SHIM_PORT"])
     if shim:
