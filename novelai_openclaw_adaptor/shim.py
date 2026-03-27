@@ -24,6 +24,7 @@ SUPPORTED_TEXT_MODELS = [
 TOOL_CALL_MARKER = "<tool_call>"
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][\w.-]*$")
 TOOL_ARG_RE = re.compile(r"^([A-Za-z_][\w.-]*)\s*:\s*(.*)$")
+PAREN_TOOL_CALL_RE = re.compile(r"^\((?P<name>[A-Za-z_][\w.-]*)\s*:\s*(?P<args>.*)\)$")
 DEBUG_ENV_VAR = "NOVELAI_SHIM_DEBUG"
 
 
@@ -87,6 +88,29 @@ def sanitize_generated_text(text: Any) -> str:
     return collapse_repeated_tail(normalize_output_text(text))
 
 
+def strip_think_markup(text: str) -> str:
+    without_blocks = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    without_tags = re.sub(r"</?think>", "", without_blocks, flags=re.IGNORECASE)
+    return without_tags
+
+
+def compute_incremental_text(previous: str, current: str) -> tuple[str, str]:
+    if not current:
+        return "", previous
+    if current.startswith(previous):
+        return current[len(previous) :], current
+    if previous.startswith(current) or current in previous:
+        return "", previous
+    prefix_len = 0
+    for left, right in zip(previous, current):
+        if left != right:
+            break
+        prefix_len += 1
+    if prefix_len:
+        return current[prefix_len:], current
+    return current, current
+
+
 def debug_enabled() -> bool:
     value = os.environ.get(DEBUG_ENV_VAR, "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -114,6 +138,32 @@ def normalize_tool_arguments(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
+def build_tool_argument_hints(tools: Any) -> dict[str, str]:
+    if not isinstance(tools, list):
+        return {}
+    hints: dict[str, str] = {}
+    for entry in tools:
+        if not isinstance(entry, dict) or entry.get("type") != "function":
+            continue
+        function = entry.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        parameters = function.get("parameters")
+        if not isinstance(name, str) or not TOOL_NAME_RE.fullmatch(name) or not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties")
+        required = parameters.get("required")
+        if isinstance(required, list) and len(required) == 1 and isinstance(required[0], str):
+            hints[name] = required[0]
+            continue
+        if isinstance(properties, dict) and len(properties) == 1:
+            only_key = next(iter(properties.keys()))
+            if isinstance(only_key, str):
+                hints[name] = only_key
+    return hints
 
 
 def parse_tool_argument_value(value: str) -> Any:
@@ -210,9 +260,67 @@ def parse_tool_block(block: str, fallback_id: str) -> dict[str, Any] | None:
     }
 
 
-def extract_tool_calls_from_text(text: Any, base_id: str, choice_index: int) -> tuple[str, list[dict[str, Any]]]:
-    source = sanitize_generated_text(content_to_text(text))
+def parse_parenthesized_tool_call(
+    line: str,
+    fallback_id: str,
+    tool_argument_hints: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    match = PAREN_TOOL_CALL_RE.match(line.strip())
+    if not match:
+        return None
+    name = match.group("name")
+    if not TOOL_NAME_RE.fullmatch(name):
+        return None
+    raw_args = match.group("args").strip()
+    parsed_value = parse_tool_argument_value(raw_args)
+    if isinstance(parsed_value, dict):
+        arguments = parsed_value
+    else:
+        arg_name = (tool_argument_hints or {}).get(name)
+        if arg_name:
+            arguments = {arg_name: parsed_value}
+        else:
+            arguments = {"input": parsed_value}
+    return {
+        "id": fallback_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        },
+    }
+
+
+def extract_parenthesized_tool_calls_from_text(
+    text: str,
+    base_id: str,
+    choice_index: int,
+    tool_argument_hints: dict[str, str] | None,
+) -> list[dict[str, Any]]:
+    parsed: list[dict[str, Any]] = []
+    for line_index, raw_line in enumerate(text.splitlines(), start=1):
+        tool_call = parse_parenthesized_tool_call(
+            raw_line,
+            f"call_{base_id}_{choice_index}_{line_index}",
+            tool_argument_hints,
+        )
+        if tool_call is not None:
+            parsed.append(tool_call)
+    return parsed
+
+
+def extract_tool_calls_from_text(
+    text: Any,
+    base_id: str,
+    choice_index: int,
+    tool_argument_hints: dict[str, str] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    source = strip_think_markup(sanitize_generated_text(content_to_text(text)))
     if TOOL_CALL_MARKER not in source:
+        parenthesized = extract_parenthesized_tool_calls_from_text(source, base_id, choice_index, tool_argument_hints)
+        if parenthesized:
+            # Force OpenClaw back into its normal multi-turn tool loop.
+            return "", parenthesized[:1]
         return source, []
 
     parts = source.split(TOOL_CALL_MARKER)
@@ -227,10 +335,21 @@ def extract_tool_calls_from_text(text: Any, base_id: str, choice_index: int) -> 
         tool_calls.append(tool_call)
 
     visible_text = "".join(visible_parts)
-    return sanitize_generated_text(visible_text), tool_calls
+    normalized_visible = sanitize_generated_text(visible_text)
+    if tool_calls:
+        return "", tool_calls[:1]
+    parenthesized = extract_parenthesized_tool_calls_from_text(normalized_visible, base_id, choice_index, tool_argument_hints)
+    if parenthesized:
+        return "", parenthesized[:1]
+    return normalized_visible, []
 
 
-def choice_tool_calls(choice: dict[str, Any], base_id: str, choice_index: int) -> list[dict[str, Any]]:
+def choice_tool_calls(
+    choice: dict[str, Any],
+    base_id: str,
+    choice_index: int,
+    tool_argument_hints: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     message = choice.get("message")
     if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
         out = []
@@ -252,15 +371,20 @@ def choice_tool_calls(choice: dict[str, Any], base_id: str, choice_index: int) -
                 out.append(normalized)
         if out:
             return out
-    _, parsed = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index)
+    _, parsed = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index, tool_argument_hints)
     return parsed
 
 
-def choice_visible_text(choice: dict[str, Any], base_id: str, choice_index: int) -> str:
+def choice_visible_text(
+    choice: dict[str, Any],
+    base_id: str,
+    choice_index: int,
+    tool_argument_hints: dict[str, str] | None = None,
+) -> str:
     message = choice.get("message")
     if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
         return sanitize_generated_text(content_to_text(message.get("content", "")))
-    text, _ = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index)
+    text, _ = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index, tool_argument_hints)
     return text
 
 
@@ -311,13 +435,17 @@ def chat_to_completions(chat_resp: dict[str, Any], model: str) -> dict[str, Any]
     }
 
 
-def upstream_to_openai_chat(chat_resp: dict[str, Any], model: str) -> dict[str, Any]:
+def upstream_to_openai_chat(
+    chat_resp: dict[str, Any],
+    model: str,
+    tool_argument_hints: dict[str, str] | None = None,
+) -> dict[str, Any]:
     choices = []
     base_id = chat_resp.get("id", "chatcmpl-novelai-shim")
     for choice in chat_resp.get("choices", []):
         index = choice.get("index", 0)
-        text = choice_visible_text(choice, base_id, index)
-        tool_calls = choice_tool_calls(choice, base_id, index)
+        text = choice_visible_text(choice, base_id, index, tool_argument_hints)
+        tool_calls = choice_tool_calls(choice, base_id, index, tool_argument_hints)
         finish_reason = choice.get("finish_reason")
         if tool_calls and finish_reason in (None, "stop"):
             finish_reason = "tool_calls"
@@ -715,6 +843,7 @@ class Handler(BaseHTTPRequestHandler):
         model: str,
         role_sent: set[int],
         stream_states: dict[int, dict[str, Any]],
+        tool_argument_hints: dict[str, str] | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         base_id = upstream_chunk.get("id", "chatcmpl-novelai-shim")
         created = upstream_chunk.get("created") or int(time.time())
@@ -722,7 +851,16 @@ class Handler(BaseHTTPRequestHandler):
         saw_non_whitespace = False
         for choice in upstream_chunk.get("choices") or []:
             index = choice.get("index", 0)
-            state = stream_states.setdefault(index, {"buffer": "", "started_text": False, "tool_mode": False})
+            state = stream_states.setdefault(
+                index,
+                {
+                    "buffer": "",
+                    "assembled_text": "",
+                    "emitted_text": "",
+                    "tool_sent": False,
+                    "suppress_after_tool": False,
+                },
+            )
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             delta_tool_calls = normalize_delta_tool_calls(delta.get("tool_calls") or choice.get("tool_calls"), base_id, index)
             raw_text, is_delta_text = extract_stream_choice_text(choice)
@@ -734,6 +872,8 @@ class Handler(BaseHTTPRequestHandler):
                 if index not in role_sent:
                     payload_delta["role"] = delta.get("role", "assistant")
                     role_sent.add(index)
+                state["tool_sent"] = True
+                state["suppress_after_tool"] = True
                 out_events.append(
                     {
                         "id": base_id,
@@ -745,73 +885,24 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 continue
 
-            if text:
+            if text and not state.get("suppress_after_tool"):
                 state["buffer"] += text
 
-            stripped_buffer = state["buffer"].lstrip()
-            if TOOL_CALL_MARKER in stripped_buffer:
-                state["tool_mode"] = True
+            visible_text, parsed_tool_calls = extract_tool_calls_from_text(
+                state["buffer"],
+                base_id,
+                index,
+                tool_argument_hints,
+            )
+            new_text, emitted_snapshot = compute_incremental_text(str(state.get("emitted_text", "")), visible_text)
+            state["emitted_text"] = emitted_snapshot
 
-            if state["tool_mode"] and finish_reason is not None:
-                visible_text, tool_calls = extract_tool_calls_from_text(state["buffer"], base_id, index)
-                payload_delta = {}
+            if new_text and not state.get("suppress_after_tool"):
+                payload_delta = {"content": new_text}
                 if index not in role_sent:
                     payload_delta["role"] = delta.get("role", "assistant")
                     role_sent.add(index)
-                if visible_text:
-                    payload_delta["content"] = visible_text
-                    if visible_text.strip():
-                        saw_non_whitespace = True
-                if tool_calls:
-                    payload_delta["tool_calls"] = tool_calls
-                if payload_delta:
-                    out_events.append(
-                        {
-                            "id": base_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": index, "delta": payload_delta, "finish_reason": None}],
-                        }
-                    )
-                out_events.append(
-                    {
-                        "id": base_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": index, "delta": {}, "finish_reason": "tool_calls" if tool_calls else finish_reason}],
-                    }
-                )
-                state["buffer"] = ""
-                state["started_text"] = True
-                continue
-
-            if not state["tool_mode"] and not state["started_text"]:
-                if stripped_buffer and (len(stripped_buffer) >= 24 or "\n" in stripped_buffer or finish_reason is not None):
-                    payload_delta = {"content": state["buffer"]}
-                    if index not in role_sent:
-                        payload_delta["role"] = delta.get("role", "assistant")
-                        role_sent.add(index)
-                    if state["buffer"].strip():
-                        saw_non_whitespace = True
-                    out_events.append(
-                        {
-                            "id": base_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": index, "delta": payload_delta, "finish_reason": None}],
-                        }
-                    )
-                    state["buffer"] = ""
-                    state["started_text"] = True
-            elif not state["tool_mode"] and text:
-                payload_delta = {"content": text}
-                if index not in role_sent:
-                    payload_delta["role"] = delta.get("role", "assistant")
-                    role_sent.add(index)
-                if text.strip():
+                if new_text.strip():
                     saw_non_whitespace = True
                 out_events.append(
                     {
@@ -822,34 +913,39 @@ class Handler(BaseHTTPRequestHandler):
                         "choices": [{"index": index, "delta": payload_delta, "finish_reason": None}],
                     }
                 )
-                state["buffer"] = ""
 
-            if finish_reason is not None and not state["tool_mode"]:
-                if state["buffer"]:
-                    payload_delta = {"content": state["buffer"]}
-                    if index not in role_sent:
-                        payload_delta["role"] = delta.get("role", "assistant")
-                        role_sent.add(index)
-                    if state["buffer"].strip():
-                        saw_non_whitespace = True
-                    out_events.append(
-                        {
-                            "id": base_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": index, "delta": payload_delta, "finish_reason": None}],
-                        }
-                    )
-                    state["buffer"] = ""
-                    state["started_text"] = True
+            if parsed_tool_calls and not state.get("tool_sent"):
+                payload_delta = {"tool_calls": parsed_tool_calls}
+                if index not in role_sent:
+                    payload_delta["role"] = delta.get("role", "assistant")
+                    role_sent.add(index)
                 out_events.append(
                     {
                         "id": base_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": index, "delta": {}, "finish_reason": finish_reason}],
+                        "choices": [{"index": index, "delta": payload_delta, "finish_reason": None}],
+                    }
+                )
+                state["tool_sent"] = True
+                state["suppress_after_tool"] = True
+                state["buffer"] = ""
+
+            if finish_reason is not None:
+                out_events.append(
+                    {
+                        "id": base_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": index,
+                                "delta": {},
+                                "finish_reason": "tool_calls" if state.get("tool_sent") else finish_reason,
+                            }
+                        ],
                     }
                 )
         return out_events, saw_non_whitespace
@@ -881,9 +977,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
         return out_events
 
-    def _stream_plain_chat_response(self, response: Any, model: str) -> None:
+    def _stream_plain_chat_response(self, response: Any, model: str, tool_argument_hints: dict[str, str] | None = None) -> None:
         detail = response.read().decode("utf-8")
-        chat_resp = upstream_to_openai_chat(json.loads(detail), model)
+        chat_resp = upstream_to_openai_chat(json.loads(detail), model, tool_argument_hints)
         self._send_chat_sse(chat_resp)
 
     def _stream_plain_completion_response(self, response: Any, model: str) -> None:
@@ -891,7 +987,13 @@ class Handler(BaseHTTPRequestHandler):
         completion_resp = chat_to_completions(json.loads(detail), model)
         self._send_completions_sse(completion_resp)
 
-    def _proxy_chat_stream(self, payload: dict[str, Any], settings: dict[str, Any], model: str) -> bool:
+    def _proxy_chat_stream(
+        self,
+        payload: dict[str, Any],
+        settings: dict[str, Any],
+        model: str,
+        tool_argument_hints: dict[str, str] | None = None,
+    ) -> bool:
         role_sent: set[int] = set()
         stream_states: dict[int, dict[str, Any]] = {}
         pending_events: list[dict[str, Any]] = []
@@ -900,13 +1002,19 @@ class Handler(BaseHTTPRequestHandler):
         with open_upstream_stream(payload, settings["upstream"], settings["api_key"]) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             if "text/event-stream" not in content_type:
-                self._stream_plain_chat_response(response, model)
+                self._stream_plain_chat_response(response, model, tool_argument_hints)
                 return True
             for raw_payload in iter_sse_payloads(response):
                 if raw_payload == "[DONE]":
                     break
                 upstream_chunk = json.loads(raw_payload)
-                events, chunk_has_text = self._normalize_upstream_chat_chunk(upstream_chunk, model, role_sent, stream_states)
+                events, chunk_has_text = self._normalize_upstream_chat_chunk(
+                    upstream_chunk,
+                    model,
+                    role_sent,
+                    stream_states,
+                    tool_argument_hints,
+                )
                 saw_non_whitespace = saw_non_whitespace or chunk_has_text
                 if not events:
                     continue
@@ -992,47 +1100,10 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             model = body.get("model", settings["model"])
+            tool_argument_hints = build_tool_argument_hints(body.get("tools"))
             if wants_stream:
                 if is_chat:
-                    primary_body = dict(upstream_body)
-                    primary_body.pop("stream", None)
-                    status, detail = call_upstream(primary_body, settings["upstream"], settings["api_key"])
-                    debug_event(
-                        "upstream_primary_response",
-                        status=status,
-                        detail_preview=truncate_debug_text(detail),
-                    )
-                    if not 200 <= status < 300:
-                        self._send_json(
-                            status,
-                            {
-                                "error": "upstream http error",
-                                "status": status,
-                                "detail": detail,
-                                "upstream_request": primary_body,
-                                "path": self.path,
-                            },
-                        )
-                        return
-                    upstream_json = try_parse_json(detail)
-                    if upstream_json is None:
-                        self._send_json(
-                            502,
-                            {
-                                "error": "upstream returned non-json success response",
-                                "status": status,
-                                "detail": detail,
-                                "upstream_request": primary_body,
-                                "path": self.path,
-                            },
-                        )
-                        return
-                    chat_resp = upstream_to_openai_chat(upstream_json, model)
-                    first_message = (((chat_resp.get("choices") or [{}])[0].get("message") or {}))
-                    content = first_message.get("content") or ""
-                    tool_calls = first_message.get("tool_calls") or []
-                    if content.strip() or tool_calls:
-                        self._send_chat_sse(chat_resp)
+                    if self._proxy_chat_stream(upstream_body, settings, model, tool_argument_hints):
                         return
                     fallback_body = {
                         "model": model,
@@ -1041,6 +1112,7 @@ class Handler(BaseHTTPRequestHandler):
                         "top_p": body.get("top_p", 1),
                         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
                         "stop": body.get("stop") if body.get("stop") is not None else ["\nuser:", "\nsystem:"],
+                        "stream": True,
                     }
                     if body.get("presence_penalty") is not None:
                         fallback_body["presence_penalty"] = body["presence_penalty"]
@@ -1048,45 +1120,7 @@ class Handler(BaseHTTPRequestHandler):
                         fallback_body["frequency_penalty"] = body["frequency_penalty"]
                     if body.get("n") is not None:
                         fallback_body["n"] = body["n"]
-                    status2, detail2 = call_upstream(fallback_body, settings["upstream"], settings["api_key"])
-                    debug_event(
-                        "upstream_fallback_response",
-                        status=status2,
-                        detail_preview=truncate_debug_text(detail2),
-                    )
-                    if not 200 <= status2 < 300:
-                        self._send_json(
-                            status2,
-                            {
-                                "error": "upstream http error",
-                                "status": status2,
-                                "detail": detail2,
-                                "upstream_request": fallback_body,
-                                "path": self.path,
-                                "fallback": True,
-                            },
-                        )
-                        return
-                    upstream_json2 = try_parse_json(detail2)
-                    if upstream_json2 is None:
-                        self._send_json(
-                            502,
-                            {
-                                "error": "upstream returned non-json success response",
-                                "status": status2,
-                                "detail": detail2,
-                                "upstream_request": fallback_body,
-                                "path": self.path,
-                                "fallback": True,
-                            },
-                        )
-                        return
-                    fallback_chat_resp = upstream_to_openai_chat(upstream_json2, model)
-                    fallback_message = (((fallback_chat_resp.get("choices") or [{}])[0].get("message") or {}))
-                    fallback_content = fallback_message.get("content") or ""
-                    fallback_tool_calls = fallback_message.get("tool_calls") or []
-                    if fallback_content.strip() or fallback_tool_calls:
-                        self._send_chat_sse(fallback_chat_resp)
+                    if self._proxy_chat_stream(fallback_body, settings, model, tool_argument_hints):
                         return
                     self._start_sse(200)
                     write_sse_event(
@@ -1137,7 +1171,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if is_chat:
-                chat_resp = upstream_to_openai_chat(upstream_json, model)
+                chat_resp = upstream_to_openai_chat(upstream_json, model, tool_argument_hints)
                 first_message = (((chat_resp.get("choices") or [{}])[0].get("message") or {}))
                 content = first_message.get("content") or ""
                 tool_calls = first_message.get("tool_calls") or []
@@ -1166,7 +1200,7 @@ class Handler(BaseHTTPRequestHandler):
                                 },
                             )
                             return
-                        chat_resp = upstream_to_openai_chat(upstream_json2, model)
+                        chat_resp = upstream_to_openai_chat(upstream_json2, model, tool_argument_hints)
                     else:
                         self._send_json(
                             status2,
