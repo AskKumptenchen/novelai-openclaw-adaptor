@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ SUPPORTED_TEXT_MODELS = [
 TOOL_CALL_MARKER = "<tool_call>"
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][\w.-]*$")
 TOOL_ARG_RE = re.compile(r"^([A-Za-z_][\w.-]*)\s*:\s*(.*)$")
+DEBUG_ENV_VAR = "NOVELAI_SHIM_DEBUG"
 
 
 def prompt_to_messages(prompt: Any) -> list[dict[str, Any]]:
@@ -64,6 +66,48 @@ def normalize_output_text(text: Any) -> str:
     if text is None:
         return ""
     return str(text).replace("\r\n", "\n").lstrip()
+
+
+def collapse_repeated_tail(text: str, *, min_block_chars: int = 24) -> str:
+    collapsed = text
+    while len(collapsed) >= min_block_chars * 2:
+        changed = False
+        for block_len in range(len(collapsed) // 2, min_block_chars - 1, -1):
+            block = collapsed[-block_len:]
+            if collapsed.endswith(block * 2):
+                collapsed = collapsed[:-block_len]
+                changed = True
+                break
+        if not changed:
+            break
+    return collapsed
+
+
+def sanitize_generated_text(text: Any) -> str:
+    return collapse_repeated_tail(normalize_output_text(text))
+
+
+def debug_enabled() -> bool:
+    value = os.environ.get(DEBUG_ENV_VAR, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def truncate_debug_text(value: Any, limit: int = 1200) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+def debug_event(event: str, **payload: Any) -> None:
+    if not debug_enabled():
+        return
+    record = {
+        "ts": int(time.time()),
+        "event": event,
+        **payload,
+    }
+    print(f"[novelai-shim-debug] {json.dumps(record, ensure_ascii=False)}", flush=True)
 
 
 def normalize_tool_arguments(value: Any) -> str:
@@ -167,9 +211,9 @@ def parse_tool_block(block: str, fallback_id: str) -> dict[str, Any] | None:
 
 
 def extract_tool_calls_from_text(text: Any, base_id: str, choice_index: int) -> tuple[str, list[dict[str, Any]]]:
-    source = content_to_text(text).replace("\r\n", "\n")
+    source = sanitize_generated_text(content_to_text(text))
     if TOOL_CALL_MARKER not in source:
-        return normalize_output_text(source), []
+        return source, []
 
     parts = source.split(TOOL_CALL_MARKER)
     visible_parts = [parts[0]]
@@ -183,7 +227,7 @@ def extract_tool_calls_from_text(text: Any, base_id: str, choice_index: int) -> 
         tool_calls.append(tool_call)
 
     visible_text = "".join(visible_parts)
-    return normalize_output_text(visible_text), tool_calls
+    return sanitize_generated_text(visible_text), tool_calls
 
 
 def choice_tool_calls(choice: dict[str, Any], base_id: str, choice_index: int) -> list[dict[str, Any]]:
@@ -215,7 +259,7 @@ def choice_tool_calls(choice: dict[str, Any], base_id: str, choice_index: int) -
 def choice_visible_text(choice: dict[str, Any], base_id: str, choice_index: int) -> str:
     message = choice.get("message")
     if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
-        return normalize_output_text(content_to_text(message.get("content", "")))
+        return sanitize_generated_text(content_to_text(message.get("content", "")))
     text, _ = extract_tool_calls_from_text(extract_choice_text(choice), base_id, choice_index)
     return text
 
@@ -246,7 +290,7 @@ def chat_to_completions(chat_resp: dict[str, Any], model: str) -> dict[str, Any]
     for choice in chat_resp.get("choices", []):
         choices.append(
             {
-                "text": extract_choice_text(choice),
+                "text": sanitize_generated_text(extract_choice_text(choice)),
                 "index": choice.get("index", 0),
                 "logprobs": None,
                 "finish_reason": choice.get("finish_reason", "stop"),
@@ -393,19 +437,38 @@ def normalize_chat_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"role": "user", "content": ""}]
 
 
+def render_tool_call_block(tool_call: dict[str, Any]) -> str:
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = str(function.get("name", "")).strip()
+    arguments = normalize_tool_arguments(function.get("arguments"))
+    return f"{TOOL_CALL_MARKER}\nname: {name}\n{arguments}"
+
+
 def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     lines = []
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
-                    parts.append(part.get("text", ""))
-                else:
-                    parts.append(str(part))
-            content = "".join(parts)
+        content = content_to_text(msg.get("content", ""))
+        if role == "assistant":
+            if content:
+                lines.append(f"assistant: {content}")
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                if not content:
+                    lines.append("assistant:")
+                for entry in tool_calls:
+                    if not isinstance(entry, dict):
+                        continue
+                    normalized = normalize_tool_call_entry(entry, str(entry.get("id") or "call_history"))
+                    if normalized is not None:
+                        lines.append(render_tool_call_block(normalized))
+            elif not content:
+                lines.append("assistant:")
+            continue
+        if role == "tool":
+            tool_name = str(msg.get("name") or msg.get("tool_call_id") or "tool")
+            lines.append(f"tool[{tool_name}]: {content}")
+            continue
         lines.append(f"{role}: {content}")
     lines.append("assistant:")
     return "\n".join(lines)
@@ -429,9 +492,10 @@ def last_user_text(messages: list[dict[str, Any]]) -> str:
 
 
 def chat_request_from_body(body: dict[str, Any]) -> dict[str, Any]:
+    messages = normalize_chat_messages(body)
     out = {
         "model": body.get("model", "glm-4-6"),
-        "prompt": messages_to_prompt(normalize_chat_messages(body)),
+        "prompt": messages_to_prompt(messages),
         "temperature": body.get("temperature", 1),
         "top_p": body.get("top_p", 1),
         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
@@ -445,7 +509,41 @@ def chat_request_from_body(body: dict[str, Any]) -> dict[str, Any]:
             out[key] = body[key]
     if body.get("stream") is not None:
         out["stream"] = body["stream"]
+    debug_event(
+        "chat_request_from_body",
+        model=out["model"],
+        message_count=len(messages),
+        tool_count=len(body.get("tools") or []),
+        tool_choice=body.get("tool_choice"),
+        stream=body.get("stream"),
+        prompt_preview=truncate_debug_text(out["prompt"]),
+    )
     return out
+
+
+def fallback_prompt_from_body(body: dict[str, Any]) -> str:
+    messages = normalize_chat_messages(body)
+    last_user = last_user_text(messages)
+    if not last_user:
+        prompt = messages_to_prompt(messages)
+        debug_event(
+            "fallback_prompt_full_history",
+            message_count=len(messages),
+            tool_count=len(body.get("tools") or []),
+            prompt_preview=truncate_debug_text(prompt),
+        )
+        return prompt
+    lines = []
+    lines.append(f"user: {last_user}")
+    lines.append("assistant:")
+    prompt = "\n".join(lines)
+    debug_event(
+        "fallback_prompt_last_user",
+        message_count=len(messages),
+        tool_count=len(body.get("tools") or []),
+        prompt_preview=truncate_debug_text(prompt),
+    )
+    return prompt
 
 
 def call_upstream(payload: dict[str, Any], upstream: str, api_key: str) -> tuple[int, str]:
@@ -724,6 +822,7 @@ class Handler(BaseHTTPRequestHandler):
                         "choices": [{"index": index, "delta": payload_delta, "finish_reason": None}],
                     }
                 )
+                state["buffer"] = ""
 
             if finish_reason is not None and not state["tool_mode"]:
                 if state["buffer"]:
@@ -883,23 +982,65 @@ class Handler(BaseHTTPRequestHandler):
         is_chat = self.path in ["/v1/chat/completions", "/chat/completions"]
         wants_stream = bool(body.get("stream"))
         upstream_body = chat_request_from_body(body) if is_chat else body
+        debug_event(
+            "incoming_request",
+            path=self.path,
+            is_chat=is_chat,
+            wants_stream=wants_stream,
+            body_preview=truncate_debug_text(json.dumps(body, ensure_ascii=False)),
+        )
 
         try:
             model = body.get("model", settings["model"])
             if wants_stream:
                 if is_chat:
-                    primary_streamed = self._proxy_chat_stream(upstream_body, settings, model)
-                    if primary_streamed:
+                    primary_body = dict(upstream_body)
+                    primary_body.pop("stream", None)
+                    status, detail = call_upstream(primary_body, settings["upstream"], settings["api_key"])
+                    debug_event(
+                        "upstream_primary_response",
+                        status=status,
+                        detail_preview=truncate_debug_text(detail),
+                    )
+                    if not 200 <= status < 300:
+                        self._send_json(
+                            status,
+                            {
+                                "error": "upstream http error",
+                                "status": status,
+                                "detail": detail,
+                                "upstream_request": primary_body,
+                                "path": self.path,
+                            },
+                        )
                         return
-                    messages = normalize_chat_messages(body)
+                    upstream_json = try_parse_json(detail)
+                    if upstream_json is None:
+                        self._send_json(
+                            502,
+                            {
+                                "error": "upstream returned non-json success response",
+                                "status": status,
+                                "detail": detail,
+                                "upstream_request": primary_body,
+                                "path": self.path,
+                            },
+                        )
+                        return
+                    chat_resp = upstream_to_openai_chat(upstream_json, model)
+                    first_message = (((chat_resp.get("choices") or [{}])[0].get("message") or {}))
+                    content = first_message.get("content") or ""
+                    tool_calls = first_message.get("tool_calls") or []
+                    if content.strip() or tool_calls:
+                        self._send_chat_sse(chat_resp)
+                        return
                     fallback_body = {
                         "model": model,
-                        "prompt": last_user_text(messages) or messages_to_prompt(messages),
+                        "prompt": fallback_prompt_from_body(body),
                         "temperature": body.get("temperature", 1),
                         "top_p": body.get("top_p", 1),
                         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
                         "stop": body.get("stop") if body.get("stop") is not None else ["\nuser:", "\nsystem:"],
-                        "stream": True,
                     }
                     if body.get("presence_penalty") is not None:
                         fallback_body["presence_penalty"] = body["presence_penalty"]
@@ -907,7 +1048,45 @@ class Handler(BaseHTTPRequestHandler):
                         fallback_body["frequency_penalty"] = body["frequency_penalty"]
                     if body.get("n") is not None:
                         fallback_body["n"] = body["n"]
-                    if self._proxy_chat_stream(fallback_body, settings, model):
+                    status2, detail2 = call_upstream(fallback_body, settings["upstream"], settings["api_key"])
+                    debug_event(
+                        "upstream_fallback_response",
+                        status=status2,
+                        detail_preview=truncate_debug_text(detail2),
+                    )
+                    if not 200 <= status2 < 300:
+                        self._send_json(
+                            status2,
+                            {
+                                "error": "upstream http error",
+                                "status": status2,
+                                "detail": detail2,
+                                "upstream_request": fallback_body,
+                                "path": self.path,
+                                "fallback": True,
+                            },
+                        )
+                        return
+                    upstream_json2 = try_parse_json(detail2)
+                    if upstream_json2 is None:
+                        self._send_json(
+                            502,
+                            {
+                                "error": "upstream returned non-json success response",
+                                "status": status2,
+                                "detail": detail2,
+                                "upstream_request": fallback_body,
+                                "path": self.path,
+                                "fallback": True,
+                            },
+                        )
+                        return
+                    fallback_chat_resp = upstream_to_openai_chat(upstream_json2, model)
+                    fallback_message = (((fallback_chat_resp.get("choices") or [{}])[0].get("message") or {}))
+                    fallback_content = fallback_message.get("content") or ""
+                    fallback_tool_calls = fallback_message.get("tool_calls") or []
+                    if fallback_content.strip() or fallback_tool_calls:
+                        self._send_chat_sse(fallback_chat_resp)
                         return
                     self._start_sse(200)
                     write_sse_event(
@@ -926,6 +1105,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             status, detail = call_upstream(upstream_body, settings["upstream"], settings["api_key"])
+            debug_event(
+                "upstream_response",
+                status=status,
+                detail_preview=truncate_debug_text(detail),
+            )
             if not 200 <= status < 300:
                 self._send_json(
                     status,
@@ -958,10 +1142,9 @@ class Handler(BaseHTTPRequestHandler):
                 content = first_message.get("content") or ""
                 tool_calls = first_message.get("tool_calls") or []
                 if not content.strip() and not tool_calls:
-                    messages = normalize_chat_messages(body)
                     fallback_body = {
                         "model": model,
-                        "prompt": last_user_text(messages) or messages_to_prompt(messages),
+                        "prompt": fallback_prompt_from_body(body),
                         "temperature": body.get("temperature", 1),
                         "top_p": body.get("top_p", 1),
                         "max_tokens": body.get("max_tokens", body.get("max_completion_tokens", 1024)),
